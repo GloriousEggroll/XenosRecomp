@@ -1,5 +1,7 @@
 project(XenosRecomp)
 
+option(XENOS_RECOMP_GOW3 "Build the Gears 3 stripped-shader adapter" OFF)
+
 if (WIN32)
     option(XENOS_RECOMP_DXIL "Generate DXIL shader cache" ON)
 endif()
@@ -27,6 +29,12 @@ target_link_libraries(XenosRecomp PRIVATE
 target_include_directories(XenosRecomp PRIVATE ${SMOLV_SOURCE_DIR})
 
 target_precompile_headers(XenosRecomp PRIVATE pch.h)
+
+if(XENOS_RECOMP_GOW3)
+    target_compile_definitions(XenosRecomp PRIVATE GOW3_RECOMP)
+    # Unsupported retail shader constructs must fail visibly, including Release.
+    target_compile_options(XenosRecomp PRIVATE $<IF:$<CXX_COMPILER_ID:MSVC>,/UNDEBUG,-UNDEBUG>)
+endif()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
     target_compile_options(XenosRecomp PRIVATE -Wno-switch -Wno-unused-variable -Wno-null-arithmetic -fms-extensions)

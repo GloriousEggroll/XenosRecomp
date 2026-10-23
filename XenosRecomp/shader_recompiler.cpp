@@ -160,6 +160,12 @@ void ShaderRecompiler::printDstSwizzle01(uint32_t dstRegister, uint32_t dstSwizz
 
 void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t address)
 {
+#ifdef GOW3_RECOMP
+    if (linkedVertexFetch) {
+        recompileGearsVertex(instr);
+        return;
+    }
+#endif
     if (instr.isPredicated)
     {
         indent();
@@ -179,6 +185,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     auto findResult = vertexElements.find(address);
     assert(findResult != vertexElements.end());
 
+#ifndef GOW3_RECOMP
     switch (findResult->second.usage)
     {
     case DeclUsage::Normal:
@@ -192,9 +199,11 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         print("tfetchTexcoord(g_SwappedTexcoords, ");
         break;
     }
+#endif
 
     print("i{}{}", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
 
+#ifndef GOW3_RECOMP
     switch (findResult->second.usage)
     {
     case DeclUsage::Normal:
@@ -207,6 +216,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         print(", {})", uint32_t(findResult->second.usageIndex));
         break;
     }
+#endif
 
     out += '.';
     printDstSwizzle(instr.dstSwizzle, true);
@@ -225,6 +235,10 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
 
 void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
 {
+#ifdef GOW3_RECOMP
+    recompileGearsTexture(instr);
+    return;
+#endif
     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
         return;
 
@@ -360,8 +374,160 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     }
 }
 
+#ifdef GOW3_RECOMP
+void ShaderRecompiler::recompileGearsVertex(const VertexFetchInstruction& instr)
+{
+    assert(!instr.srcRegisterAm && !instr.dstRegisterAam && "Relative vertex registers unsupported");
+    switch (instr.format) {
+    case 6: case 7: case 16: case 17: case 25: case 26: case 31: case 32:
+    case 33: case 34: case 35: case 36: case 37: case 38: case 57: break;
+    default: assert(false && "Unknown linked vertex format");
+    }
+    indent();
+    if (instr.isPredicated) print("if ({}p0) ", instr.predicateCondition ? "" : "!");
+    out += "{\n";
+    ++indentation;
+    if (!instr.isMiniFetch) {
+        assert(instr.constIndexSelect < 3);
+        indent(); println("gow3VertexSlot = {};", instr.constIndex * 3 + instr.constIndexSelect);
+        indent();
+        if (instr.stride) {
+            println("gow3VertexWord = int(floor(r{}.{} + {})) * {};", uint32_t(instr.srcRegister),
+                SWIZZLES[instr.srcSwizzle], instr.isIndexRounded ? 0.5f : 0.0f, uint32_t(instr.stride));
+        } else out += "gow3VertexWord = 0;\n";
+    }
+    bool writes = false;
+    for (uint32_t i = 0; i < 4; ++i) {
+        const auto swizzle = getDestSwizzle(instr.dstSwizzle, i);
+        assert(swizzle != FetchDestinationSwizzle(6));
+        writes |= swizzle <= FetchDestinationSwizzle::W;
+    }
+    if (writes) {
+        indent();
+        println("float4 fetched = gow3FetchVertex(gow3VertexSlot, gow3VertexWord + ({}), {}, {}, {}, {}, {});",
+                int32_t(instr.offset), uint32_t(instr.format), instr.formatCompAll ? "true" : "false",
+                instr.numFormatAll ? "true" : "false", instr.signedRfModeAll ? "true" : "false", int32_t(instr.expAdjust));
+        indent(); print("r{}.", instr.dstRegister); printDstSwizzle(instr.dstSwizzle, false);
+        out += " = fetched."; printDstSwizzle(instr.dstSwizzle, true); out += ";\n";
+    }
+    printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
+    --indentation;
+    indent(); out += "}\n";
+}
+
+void ShaderRecompiler::recompileGearsTexture(const TextureFetchInstruction& instr)
+{
+    assert(!instr.srcRegisterAm && !instr.dstRegisterAm && "Relative texture registers unsupported");
+    auto source = [&](uint32_t components) {
+        print("r{}.", instr.srcRegister);
+        for (uint32_t i = 0; i < components; ++i)
+            out += SWIZZLES[(instr.srcSwizzle >> (i * 2)) & 3];
+    };
+    // A separate scope also keeps temporaries valid across switch/PC labels.
+    indent();
+    if (instr.isPredicated) print("if ({}p0) ", instr.predCondition ? "" : "!");
+    out += "{\n";
+    ++indentation;
+    bool storesResult = true;
+    switch (instr.opcode)
+    {
+    case FetchOpcode::SetTextureLod:
+    case FetchOpcode::SetTextureGradientsHorz:
+    case FetchOpcode::SetTextureGradientsVert:
+        indent();
+        if (instr.opcode == FetchOpcode::SetTextureLod) {
+            out += "gow3TextureLod = "; source(1);
+        } else {
+            print("gow3TextureGradients{} = ", instr.opcode == FetchOpcode::SetTextureGradientsHorz ? "H" : "V");
+            source(3);
+        }
+        out += ";\n";
+        storesResult = false;
+        break;
+    case FetchOpcode::GetTextureGradients:
+        assert(isPixelShader && "Texture derivatives require a pixel shader");
+        indent(); out += "float2 coord = "; source(2); out += ";\n";
+        indent(); out += "float4 fetched = float4(ddx_coarse(coord), ddy_coarse(coord)).xzyw;\n";
+        break;
+    case FetchOpcode::TextureFetch:
+    case FetchOpcode::GetTextureWeights:
+    {
+        const bool oneD = instr.dimension == TextureDimension::Texture1D;
+        const bool cube = instr.dimension == TextureDimension::TextureCube;
+        const auto dimension = (oneD || instr.dimension == TextureDimension::Texture2D) ? "2D" : (cube ? "Cube" : "3D");
+        const uint32_t components = oneD ? 1 : (instr.dimension == TextureDimension::Texture2D ? 2 : 3);
+        std::string sampler = fmt::format("s{}", instr.constIndex);
+        if (auto found = samplers.find(instr.constIndex); found != samplers.end()) sampler = found->second;
+        const bool weights = instr.opcode == FetchOpcode::GetTextureWeights;
+        // All captured texture reads use the fetch-constant filtering state.
+        // Overrides need a distinct host sampler binding; never ignore them.
+        assert((weights || (instr.magFilter == 3 && instr.minFilter == 3 && instr.mipFilter == 3 &&
+                            instr.anisoFilter == 7)) && "Texture filter override needs a sampler variant");
+        if (weights) {
+            assert(instr.dimension == TextureDimension::Texture2D && !instr.useCompLod &&
+                   !instr.useRegLod && !instr.useRegGradients && !instr.lodBias &&
+                   "Only base-level 2D interpolation weights supported");
+        }
+        indent();
+        print("float4 fetched = gow3{}{}({}_Texture{}DescriptorIndex, {}_SamplerDescriptorIndex, ",
+              weights ? "Weights" : "Fetch", dimension, sampler, dimension, sampler);
+        if (oneD) out += "float2(";
+        if (cube) out += "cubeMapData.cubeMapDirections[uint(";
+        if (cube) { print("r{}.{}", instr.srcRegister, SWIZZLES[(instr.srcSwizzle >> 4) & 3]); }
+        else source(components);
+        if (cube) out += ")]";
+        if (oneD) out += ", 0.5)"; // 1D resources use a height-one native 2D image.
+        if (cube) {
+            assert(!instr.texCoordDenorm && !instr.offsetX && !instr.offsetY && !instr.offsetZ &&
+                   "Cube offsets/unnormalized coordinates unsupported");
+        } else {
+            print(", float{}({}, {}", components == 3 ? 3 : 2, instr.offsetX * 0.5f,
+                  oneD ? 0.0f : instr.offsetY * 0.5f);
+            if (components == 3) print(", {}", instr.offsetZ * 0.5f);
+            print("), {}", instr.texCoordDenorm ? "true" : "false");
+        }
+        if (!weights) {
+            const bool computed = instr.useCompLod && (isPixelShader || instr.useRegGradients);
+            // Xenos ignores implicit derivatives in a vertex shader. Without
+            // computed/register LOD it fetches level zero, not Sample().
+            print(", {}, {}, {} + {}, gow3TextureGradientsH, gow3TextureGradientsV",
+                  computed ? "true" : "false", instr.useRegGradients ? "true" : "false",
+                  instr.useRegLod ? "gow3TextureLod" : "0.0", instr.lodBias / 16.0f);
+        }
+        out += ");\n";
+        if (!weights) println("fetched = gow3TextureResult(fetched, {});", instr.constIndex);
+        break;
+    }
+    default:
+        assert(false && "Unsupported texture opcode must not be silently omitted");
+    }
+    if (storesResult) {
+        bool writesComponents = false;
+        for (uint32_t i = 0; i < 4; ++i) {
+            const auto swizzle = getDestSwizzle(instr.dstSwizzle, i);
+            assert(swizzle != FetchDestinationSwizzle(6) && "Reserved destination swizzle");
+            writesComponents |= swizzle <= FetchDestinationSwizzle::W;
+        }
+        if (writesComponents) {
+            indent(); print("r{}.", instr.dstRegister); printDstSwizzle(instr.dstSwizzle, false);
+            out += " = fetched."; printDstSwizzle(instr.dstSwizzle, true); out += ";\n";
+        }
+        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
+    }
+    --indentation;
+    indent(); out += "}\n";
+}
+#endif
+
 void ShaderRecompiler::recompile(const AluInstruction& instr)
 {
+#ifdef GOW3_RECOMP
+    // Vector and scalar halves read the same pre-instruction registers.
+    // Delay the vector destination write until both results are evaluated.
+    // The scope also makes the temporary safe across CF case labels.
+    indent(); out += "{\n";
+    ++indentation;
+#endif
     if (instr.isPredicated)
     {
         indent();
@@ -482,8 +648,25 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                 }
                 else
                 {
+#ifdef GOW3_RECOMP
+                    if (strippedConstants && !definedFloatConstants[reg])
+                    {
+                        // The first constant operand uses const0; subsequent
+                        // constant operands use const1 (not the operand number).
+                        bool firstConstant = operand == VECTOR_0 ||
+                            (operand == VECTOR_1 ? bool(instr.src1Select) :
+                                bool(instr.src1Select && instr.src2Select));
+                        bool addressed = firstConstant ? instr.const0Relative : instr.const1Relative;
+                        regFormatted = fmt::format("gow3LoadConstant({}{})", reg,
+                            addressed ?
+                                (instr.constAddressRegisterRelative ? " + a0" : " + aL") : "");
+                    }
+                    else
+#endif
+                    {
                     assert(!instr.const0Relative && !instr.const1Relative);
                     regFormatted = fmt::format("c{}", reg);
+                    }
                 }
             }
 
@@ -518,6 +701,13 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
                 case AluVectorOpcode::Dp4:
                 case AluVectorOpcode::Max4:
+                // Kill tests always read all four source components. The
+                // destination mask only controls the optional zero result;
+                // it must not restrict which components can discard a pixel.
+                case AluVectorOpcode::KillEq:
+                case AluVectorOpcode::KillGt:
+                case AluVectorOpcode::KillGe:
+                case AluVectorOpcode::KillNe:
                     mask = 0b1111;
                     break;
 
@@ -571,7 +761,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     
     case AluVectorOpcode::KillNe:
         indent();
-        println("clip(any({} != {}) ? -1 : 1);", op(VECTOR_0), op(VECTOR_1));
+        // Xenos KILL_NE is unordered: a NaN in either operand kills the pixel.
+        // DXC may lower ordinary HLSL != to an ordered comparison. Preserve
+        // the NaN condition through integer bit tests, as for alpha testing.
+        println("clip((any((asuint({0}) & 0x7fffffffu) > 0x7f800000u) || any((asuint({1}) & 0x7fffffffu) > 0x7f800000u) || any({0} != {1})) ? -1 : 1);",
+                op(VECTOR_0), op(VECTOR_1));
         break;
     }
 
@@ -669,6 +863,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
     if (vectorWriteMask != 0)
     {
+#ifdef GOW3_RECOMP
+        indent(); out += "float4 gow3VectorResult;\n";
+        indent(); out += "gow3VectorResult.";
+#else
         indent();
         if (!exportRegister.empty())
         {
@@ -679,6 +877,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         {
             print("r{}.", instr.vectorDest);
         }
+#endif
 
         for (size_t i = 0; i < 4; i++)
         {
@@ -1030,6 +1229,20 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         }
     }
 
+#ifdef GOW3_RECOMP
+    if (vectorWriteMask != 0)
+    {
+        indent();
+        if (!exportRegister.empty())print("{}.", exportRegister);
+        else print("r{}.", instr.vectorDest);
+        for (size_t i = 0; i < 4; ++i)
+            if ((vectorWriteMask >> i) & 1)out += SWIZZLES[i];
+        out += " = gow3VectorResult.";
+        for (size_t i = 0; i < 4; ++i)
+            if ((vectorWriteMask >> i) & 1)out += SWIZZLES[i];
+        out += ";\n";
+    }
+#endif
     uint32_t scalarWriteMask = instr.scalarWriteMask;
     if (instr.exportData)
         scalarWriteMask &= ~instr.vectorWriteMask;
@@ -1096,6 +1309,10 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         indent();
         out += "}\n";
     }
+#ifdef GOW3_RECOMP
+    --indentation;
+    indent(); out += "}\n";
+#endif
 }
 
 void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
@@ -1103,17 +1320,42 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
 
     assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
+#ifdef GOW3_RECOMP
+    strippedConstants = shaderContainer->constantTableOffset == 0;
+    out += "#define GOW3_RECOMP 1\n";
+#else
     assert(shaderContainer->constantTableOffset != NULL);
+#endif
 
+    isPixelShader = (shaderContainer->flags & 0x1) == 0;
+#ifdef GOW3_RECOMP
+    linkedVertexFetch = !isPixelShader && (shaderContainer->flags & 0x40);
+    if (!isPixelShader) out += "#define GOW3_VERTEX_SHADER 1\n";
+#endif
     out += include;
     out += '\n';
 
-    isPixelShader = (shaderContainer->flags & 0x1) == 0;
-
-    const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
+    const ConstantTableContainer emptyConstantTable{};
+    const auto constantTableContainer = shaderContainer->constantTableOffset != 0 ?
+        reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset) : &emptyConstantTable;
     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
 
     out += "#ifdef __spirv__\n\n";
+
+#ifdef GOW3_RECOMP
+    out += "int4 gow3LoadLoopConstant(uint index) { uint v = vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 576 + index * 4); return int4(v & 255, (v >> 8) & 255, (int(v << 8) >> 24), 0); }\n";
+    if (strippedConstants)
+    {
+        println("float4 gow3LoadConstant(int index) {{ return select(index >= 0 && index < 256, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + clamp(index, 0, 255) * 16, 16), 0.0); }}",
+            isPixelShader ? "Pixel" : "Vertex");
+        for (uint32_t i = 0; i < 32; ++i)
+        {
+            for (uint32_t j = 0; j < std::size(TEXTURE_DIMENSIONS); ++j)
+                println("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})", i, TEXTURE_DIMENSIONS[j], j * 128 + i * 4);
+            println("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})", i, 384 + i * 4);
+        }
+    }
+#endif
 
 #ifdef UNLEASHED_RECOMP
     bool isMetaInstancer = false;
@@ -1278,8 +1520,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     {
         out += "\tin float4 iPos : SV_Position,\n";
 
-        for (auto& [usage, usageIndex] : INTERPOLATORS)
+        for (size_t i = 0; i < std::size(INTERPOLATORS); ++i)
+        {
+            auto [usage, usageIndex] = INTERPOLATORS[i];
+#ifdef GOW3_RECOMP
+            print("[[vk::location({})]] ", i);
+#endif
             println("\tin float4 i{0}{1} : {2}{1},", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+        }
 
         out += "#ifdef __spirv__\n";
         out += "\tin bool iFace : SV_IsFrontFace\n";
@@ -1313,6 +1561,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + i];
 
             const char* usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
+#ifdef GOW3_RECOMP
+            // Linked Gears shaders pull their raw vertex data using the actual
+            // fetch instruction. Unlinked templates accept decoded float data.
+            if (linkedVertexFetch) continue;
+            usageType = "float4";
+#endif
 
         #ifdef UNLEASHED_RECOMP
             if ((vertexElement.usage == DeclUsage::TexCoord && vertexElement.usageIndex == 2 && isMetaInstancer) ||
@@ -1324,6 +1578,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             out += '\t';
 
+#ifdef GOW3_RECOMP
+            // Bind attributes in the shader's declaration order. Sonic's
+            // fixed semantic/location table is not valid for Gears layouts.
+            print("[[vk::location({})]] ", i);
+#else
             for (auto& usageLocation : USAGE_LOCATIONS)
             {
                 if (usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
@@ -1332,6 +1591,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     break;
                 }
             }
+#endif
 
             println("in {0} i{1}{2} : {3}{2},", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
                 uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
@@ -1347,14 +1607,29 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         }
     #endif
 
+#ifdef GOW3_RECOMP
+        if (linkedVertexFetch) out += "\tin uint iVertexId : SV_VertexID,\n";
+#endif
         out += "\tout float4 oPos : SV_Position";
 
-        for (auto& [usage, usageIndex] : INTERPOLATORS)
-            print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+        for (size_t i = 0; i < std::size(INTERPOLATORS); ++i)
+        {
+            auto [usage, usageIndex] = INTERPOLATORS[i];
+            out += ",\n";
+#ifdef GOW3_RECOMP
+            print("[[vk::location({})]] ", i);
+#endif
+            print("\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+        }
     }
 
     out += ")\n";
     out += "{\n";
+
+#ifdef GOW3_RECOMP
+    if (isPixelShader)
+        out += "#ifdef GOW3_NATIVE_FSI\nfloat2 gow3FsiDepthSlope = float2(ddx_coarse(iPos.z), ddy_coarse(iPos.z));\n#endif\n";
+#endif
 
 #ifdef UNLEASHED_RECOMP
     if (hasMtxProjection)
@@ -1383,6 +1658,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}));",
                     definition->registerIndex + i - (isPixelShader ? 256 : 0), value[0].get(), value[1].get(), value[2].get(), value[3].get());
+#ifdef GOW3_RECOMP
+                auto constantIndex = definition->registerIndex + i - (isPixelShader ? 256 : 0);
+                assert(constantIndex < 256);
+                definedFloatConstants[constantIndex] = true;
+#endif
 
                 value += 4;
             }
@@ -1409,7 +1689,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 value = definition->values[i].get();
 
                 println("\tint4 i{} = int4({}, {}, {}, {});",
+#ifdef GOW3_RECOMP
+                    (definition->registerIndex - 8992) / 4 + i, uint8_t(x), uint8_t(y), z, uint8_t(w));
+                const auto index = (definition->registerIndex - 8992) / 4 + i;
+                assert(index < 32);
+                definedLoopConstants[index] = true;
+#else
                     (definition->registerIndex - 8992) / 4 + i, x, y, z, w);
+#endif
             }
             definitions += 2;
             definitions += definition->count;
@@ -1418,7 +1705,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\n";
     }
 
-    bool printedRegisters[32]{};
+    bool printedRegisters[64]{};
 
     uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
 
@@ -1457,7 +1744,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\n";
     }
 
-    for (size_t i = 0; i < 32; i++)
+    for (size_t i = 0; i < std::size(printedRegisters); i++)
     {
         if (!printedRegisters[i])
         {
@@ -1466,6 +1753,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
             }
+#ifdef GOW3_RECOMP
+            else if (linkedVertexFetch && i == 0) out += "float4(float(iVertexId), 0.0, 0.0, 0.0);\n";
+#endif
         #ifdef UNLEASHED_RECOMP
             else if (!isPixelShader && hasIndexCount && i == 0)
             {
@@ -1481,9 +1771,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     out += "\tint a0 = 0;\n";
     out += "\tint aL = 0;\n";
+#ifdef GOW3_RECOMP
+    out += "\tuint4 gow3LoopCounts = 0;\n\tint4 gow3LoopAddresses = 0;\n";
+    out += "\tfloat gow3TextureLod = 0;\n\tfloat3 gow3TextureGradientsH = 0, gow3TextureGradientsV = 0;\n";
+    if (linkedVertexFetch) out += "\tuint gow3VertexSlot = 0;\n\tint gow3VertexWord = 0;\n";
+#endif
     out += "\tbool p0 = false;\n";
     out += "\tfloat ps = 0.0;\n";
+#ifndef GOW3_RECOMP
     if (isPixelShader)
+#endif
     {
 #ifdef UNLEASHED_RECOMP
         out += "\tfloat2 pixelCoord = 0.0;\n";
@@ -1508,7 +1805,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     auto controlFlowCode = code;
     uint32_t instrAddress = 0;
     uint32_t instrSize = shader->size;
+    // Gears uses overlapping forward branches, which cannot in general be
+    // represented by the Unleashed-specific nested-if reconstruction. Keep
+    // explicit instruction labels for this title.
+#ifdef GOW3_RECOMP
+    bool simpleControlFlow = false;
+#else
     bool simpleControlFlow = true;
+#endif
 
     while (instrAddress < instrSize)
     {
@@ -1630,7 +1934,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 address = cfInstr.condExec.address;
                 count = cfInstr.condExec.count;
                 sequence = cfInstr.condExec.sequence;
-                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecEnd);
+                shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecEnd || cfInstr.opcode == ControlFlowOpcode::CondExecPredCleanEnd);
+#ifdef GOW3_RECOMP
+                indent();
+                println("if (((vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}) >> {}) & 1) == {})",
+                    512 + uint32_t(cfInstr.condExec.boolAddress / 32) * 4,
+                    uint32_t(cfInstr.condExec.boolAddress % 32), uint32_t(cfInstr.condExec.condition));
+                indent(); out += "{\n"; ++indentation;
+                shouldCloseCurlyBracket = true;
+#endif
                 break;
 
             case ControlFlowOpcode::CondExecPred:
@@ -1639,9 +1951,27 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 count = cfInstr.condExecPred.count;
                 sequence = cfInstr.condExecPred.sequence;
                 shouldReturn = (cfInstr.opcode == ControlFlowOpcode::CondExecPredEnd);
+#ifdef GOW3_RECOMP
+                indent();
+                println("if ({}p0)", cfInstr.condExecPred.condition ? "" : "!");
+                indent(); out += "{\n"; ++indentation;
+                shouldCloseCurlyBracket = true;
+#endif
                 break;
 
             case ControlFlowOpcode::LoopStart:
+#ifdef GOW3_RECOMP
+            {
+                const auto id = uint32_t(cfInstr.loopStart.loopId);
+                const auto constant = definedLoopConstants[id] ? fmt::format("i{}", id) : fmt::format("gow3LoadLoopConstant({})", id);
+                println("\t\t\tgow3LoopCounts = uint4({}.x, gow3LoopCounts.xyz);", constant);
+                println("\t\t\tgow3LoopAddresses = int4({}, gow3LoopAddresses.xyz);",
+                    cfInstr.loopStart.isRepeat ? std::string("gow3LoopAddresses.x") : constant + ".y");
+                out += "\t\t\taL = gow3LoopAddresses.x;\n";
+                println("\t\t\tif (gow3LoopCounts.x == 0) {{ pc = {}; continue; }}", uint32_t(cfInstr.loopStart.address));
+                break;
+            }
+#else
                 if (simpleControlFlow)
                 {
                     indent();
@@ -1658,8 +1988,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     out += "\t\t\taL = 0;\n";
                 }
                 break;
+#endif
 
             case ControlFlowOpcode::LoopEnd:
+#ifdef GOW3_RECOMP
+            {
+                const auto id = uint32_t(cfInstr.loopEnd.loopId);
+                const auto constant = definedLoopConstants[id] ? fmt::format("i{}", id) : fmt::format("gow3LoadLoopConstant({})", id);
+                println("\t\t\tif (--gow3LoopCounts.x != 0{}) {{",
+                    cfInstr.loopEnd.isPredicatedBreak ? (cfInstr.loopEnd.condition ? " && !p0" : " && p0") : "");
+                println("\t\t\t\tgow3LoopAddresses.x += {}.z;", constant);
+                out += "\t\t\t\taL = gow3LoopAddresses.x;\n";
+                println("\t\t\t\tpc = {}; continue;", uint32_t(cfInstr.loopEnd.address));
+                out += "\t\t\t}\n\t\t\tgow3LoopCounts = uint4(gow3LoopCounts.yzw, 0);\n";
+                out += "\t\t\tgow3LoopAddresses = int4(gow3LoopAddresses.yzw, 0);\n\t\t\taL = gow3LoopAddresses.x;\n";
+                break;
+            }
+#else
                 if (simpleControlFlow)
                 {
                     --indentation;
@@ -1676,6 +2021,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     out += "\t\t\t}\n";
                 }
                 break;
+#endif
+
+#ifdef GOW3_RECOMP
+            case ControlFlowOpcode::CondCall:
+            case ControlFlowOpcode::Return:
+                assert(false && "Shader subroutines are not yet supported");
+                break;
+#endif
 
             case ControlFlowOpcode::CondJmp:
             {
@@ -1694,11 +2047,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     }
                     else
                     {
+#ifdef GOW3_RECOMP
+                        println("if (((vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {}) >> {}) & 1) {}= 0)",
+                            512 + uint32_t(cfInstr.condJmp.boolAddress / 32) * 4,
+                            uint32_t(cfInstr.condJmp.boolAddress % 32), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+#else
                         auto findResult = boolConstants.find(cfInstr.condJmp.boolAddress);
                         if (findResult != boolConstants.end())
                             println("if ((g_Booleans & {}) {}= 0)", findResult->second, cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
                         else
                             println("if (b{} {}= 0)", uint32_t(cfInstr.condJmp.boolAddress), cfInstr.condJmp.condition ^ simpleControlFlow ? "!" : "=");
+#endif
                     }
 
                     if (simpleControlFlow)
@@ -1794,9 +2153,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             if (shouldReturn)
             {
-                if (isPixelShader)
+                if (isPixelShader && (reinterpret_cast<const PixelShader*>(shader)->outputs & PIXEL_SHADER_OUTPUT_COLOR0))
                 {
                     specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
+                #ifdef GOW3_RECOMP
+                    specConstantsMask |= 7u << 8;
+                #endif
 
                     indent();
                     out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_ALPHA_TEST)";
@@ -1804,7 +2166,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     out += '{';
 
                     indent();
+                #ifdef GOW3_RECOMP
+                    // Xenos functions are a less/equal/greater bit mask, with
+                    // explicit unordered behavior for not-equal and always.
+                    // XOR6 retains the original >= specialization value2.
+                    out += "\tuint gow3AlphaFunction = ((g_SpecConstants() >> 8) & 7u) ^ 6u;\n";
+                    out += "\tbool gow3AlphaPass = gow3AlphaFunction == 7u || (gow3AlphaFunction == 5u ? (((asuint(oC0.w) & 0x7fffffffu) > 0x7f800000u) || ((asuint(g_AlphaThreshold) & 0x7fffffffu) > 0x7f800000u) || oC0.w != g_AlphaThreshold) : (((gow3AlphaFunction & 1u) != 0u && oC0.w < g_AlphaThreshold) || ((gow3AlphaFunction & 2u) != 0u && oC0.w == g_AlphaThreshold) || ((gow3AlphaFunction & 4u) != 0u && oC0.w > g_AlphaThreshold)));\n";
+                    out += "\tif (!gow3AlphaPass) discard;\n";
+                #else
                     out += "\tclip(oC0.w - g_AlphaThreshold);\n";
+                #endif
 
                     indent();
                     out += "}";
@@ -1826,7 +2197,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     out += '}';
                 #endif
                 }
-                else
+                else if (!isPixelShader)
                 {
                 #ifdef UNLEASHED_RECOMP
                     if (!hasMtxProjection)
@@ -1836,6 +2207,38 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     }
                 }
 
+#ifdef GOW3_RECOMP
+                if (isPixelShader)
+                {
+                    // Alpha testing uses the unbiased shader result. The RB
+                    // exponent scale applies to all channels before blending.
+                    const auto outputs = reinterpret_cast<const PixelShader*>(shader)->outputs;
+                    for (unsigned target = 0; target < 4; ++target)
+                    {
+                        if (outputs & (PIXEL_SHADER_OUTPUT_COLOR0 << target))
+                        {
+                            indent();
+                            out += fmt::format("oC{} *= g_ColorScale[{}];\n", target, target);
+                        }
+                    }
+                    out += "\n#ifdef GOW3_NATIVE_FSI\n";
+                    out += "gow3NativeRasterOutput(iPos.xy, ";
+                    out += (outputs & PIXEL_SHADER_OUTPUT_DEPTH) ? "oDepth" : "iPos.z";
+                    out += ", iFace, ";
+                    unsigned export_mask = 0;
+                    for (unsigned target = 0; target < 4; ++target)
+                    {
+                        if (outputs & (PIXEL_SHADER_OUTPUT_COLOR0 << target))
+                        {
+                            export_mask |= 1u << target;
+                            out += fmt::format("oC{}, ", target);
+                        }
+                        else out += "float4(0,0,0,0), ";
+                    }
+                    out += fmt::format("{}u, {}, gow3FsiDepthSlope);\n#endif\n", export_mask,
+                        (outputs & PIXEL_SHADER_OUTPUT_DEPTH) ? "true" : "false");
+                }
+#endif
                 if (simpleControlFlow)
                 {
                     indent();
@@ -1852,7 +2255,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 }
                 else
                 {
+#ifdef GOW3_RECOMP
+                    out += "\t\t\treturn;\n";
+#else
                     out += "\t\t\tbreak;\n";
+#endif
                 }
             }
 

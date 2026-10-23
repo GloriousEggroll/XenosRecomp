@@ -33,6 +33,12 @@ struct ShaderRecompiler : StringBuffer
     std::unordered_map<uint32_t, const char*> samplers;
     std::unordered_map<uint32_t, uint32_t> ifEndLabels;
     uint32_t specConstantsMask = 0;
+#ifdef GOW3_RECOMP
+    bool strippedConstants = false;
+    bool linkedVertexFetch = false;
+    bool definedFloatConstants[256]{};
+    bool definedLoopConstants[32]{};
+#endif
 
 #ifdef UNLEASHED_RECOMP
     bool hasMtxProjection = false;
@@ -41,6 +47,11 @@ struct ShaderRecompiler : StringBuffer
 
     void indent()
     {
+#ifdef GOW3_RECOMP
+        // An unmatched branch must fail here, rather than underflowing the
+        // unsigned depth and allocating gigabytes of indentation.
+        assert(indentation < 128 && "Unbalanced shader control flow");
+#endif
         for (uint32_t i = 0; i < indentation; i++)
             out += '\t';
     }
@@ -50,6 +61,10 @@ struct ShaderRecompiler : StringBuffer
 
     void recompile(const VertexFetchInstruction& instr, uint32_t address);
     void recompile(const TextureFetchInstruction& instr, bool bicubic);
+#ifdef GOW3_RECOMP
+    void recompileGearsTexture(const TextureFetchInstruction& instr);
+    void recompileGearsVertex(const VertexFetchInstruction& instr);
+#endif
     void recompile(const AluInstruction& instr);
 
     void recompile(const uint8_t* shaderData, const std::string_view& include);
